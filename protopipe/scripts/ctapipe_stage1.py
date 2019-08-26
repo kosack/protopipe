@@ -1,85 +1,160 @@
 """ 
-User Tools to process  {R0,R1,DL0}/Event data into DL1/Event data
+Tool to process  {R0,R1,DL0}/Event data into DL1/Event data
 """
-from collections import OrderedDict, defaultdict, namedtuple
+from collections import OrderedDict, namedtuple
 from functools import partial
-from pathlib import Path
 
 import numpy as np
+import tables.filters
 import traitlets
-
-import ctapipe
 from ctapipe.calib.camera import CameraCalibrator
 from ctapipe.core import Component, Container, Field, Tool, ToolConfigurationError
 from ctapipe.core.traits import Bool, CaselessStrEnum, Dict, Float, Int, List, Unicode
-from ctapipe.image import HillasParameterizationError, hillas_parameters, tailcuts_clean
+from ctapipe.image import hillas_parameters, tailcuts_clean
 from ctapipe.image.concentration import concentration
 from ctapipe.image.leakage import leakage
 from ctapipe.image.timing_parameters import timing_parameters
 from ctapipe.instrument import CameraGeometry, TelescopeDescription
 from ctapipe.io import EventSource, HDF5TableWriter
 from ctapipe.io.containers import (
-    ConcentrationContainer,
     DL1CameraContainer,
     EventIndexContainer,
-    HillasParametersContainer,
     ImageParametersContainer,
-    LeakageContainer,
     TelEventIndexContainer,
-    TimingParametersContainer,
 )
-from ctapipe.utils import CutFlow
-import tables.filters
 
 RangeTuple = namedtuple("RangeTuple", "min,max")
 
 
-class Range(traitlets.TraitType):
-    """ A Traitlet that accepts a range like (min,max) or [min,max] """
+class TelescopeParameter(traitlets.Dict):
+    """
+    Apply a parameter to a telescope based on the telescope's id or type name.
+    The various parameter values are given as a `dict` of string keys and float
+    values. The keys can be:
 
-    # TODO: make unit tests.
-    default_value = (-np.inf, np.inf)
-    info_text = "a tuple or list of (min, max) values, with min<=max"
+    - '*' match all telescopes (default value)
+    - a telescope type string (e.g. 'type SST_ASTRI_CHEC') to apply to all telescopes of
+        that type
+    - a glob pattern for a telescope string (e.g.  'type SST_*') to apply to all
+        types matching that pattern
+    - a specific telescope ID ('id 89')
+
+    These are evaluated in-order, so you can first set a default value, and then set
+    values for specific telescopes or types
+
+    Examples
+    --------
+
+    .. code-block: python
+    {
+        '*': 5.0,                       # default
+        'type LST_LST_LSTCam': 5.2,
+        'type MST_MST_NectarCam': 4.0,
+        'type MST_MST_FlashCam': 4.5,
+        'id 34' 4.0,                   # override telescope 34 specifically
+    }
+    """
 
     def validate(self, obj, value):
-        if isinstance(value, tuple) or isinstance(value, list):
-            if len(value) == 2:
-                if value[0] <= value[1]:
-                    return RangeTuple(*value)
+        super().validate(obj, value)
 
-        self.error(obj, value)
+        for key, val in value.items():
+            if type(key) is not str:
+                raise traitlets.TraitError("telescope type must be a string")
+            if type(val) not in [float, int]:
+                raise traitlets.TraitError(
+                    f"value must be a float, got {val}" f" ({type(val)}) instead"
+                )
+            if not any(key.startswith(x) for x in ["*", "type ", "id ", "slice "]):
+                raise traitlets.TraitError(
+                    f"key '{key}' must be '*', 'type <type>', "
+                    f"'id <tel_id>' or 'slice <slice>'"
+                )
+            if key.startswith("id "):
+                tokens = key.split(" ")
+                try:
+                    tel_id = int(tokens[1])  # will fail if not parsable
+                except ValueError as err:
+                    raise traitlets.TraitError(
+                        f"couldn't parse telescope id '{tokens[1]}'"
+                    )
+
+            value[key] = float(val)
+        return value
+
+
+class TelescopeParameterResolver:
+    def __init__(
+        self,
+        subarray: "ctapipe.instrument.SubarrayDescription",
+        tel_param: TelescopeParameter,
+    ):
+        """
+        Handles looking up a parameter by telescope_id, given a TelescopeParameter
+        trait (which maps a parameter to a set of telescopes by type, id, or other
+        selection criteria).
+
+        Parameters
+        ----------
+        subarray: ctapipe.instrument.SubarrayDescription
+            description of the subarray (includes mapping of tel_id to tel_type)
+        tel_param: TelescopeParameter
+            the parameter definitions as a map of key to value
+        """
+
+        # build dictionary mapping tel_id to parameter:
+        self._value_for_tel_id = {}
+
+        for key, value in tel_param.items():
+            if key == "*":
+                for tel_id in subarray.tel_ids:
+                    self._value_for_tel_id[tel_id] = value
+            else:
+                command, argument = key.split(" ")
+                if command == "type":
+                    for tel_id in subarray.get_tel_ids_for_type(argument):
+                        self._value_for_tel_id[tel_id] = value
+                elif command == "id":
+                    self._value_for_tel_id[int(argument)] = value
+                else:
+                    raise ValueError(f"Unrecognized command: {command}")
+
+    def value_for_tel_id(self, tel_id: int) -> float:
+        """
+        returns the resolved parameter for the given telescope id
+        """
+        return self._value_for_tel_id[tel_id]
 
 
 class DataChecker(Component):
 
     selection_functions = Dict(
-        help="dict of cut name : lambda function in string format to accept (select) data"
+        help=(
+            "dict of '<cut name>' : lambda function in string format to accept ("
+            "select) a given data value.  E.g. `{'mycut': 'lambda x: x > 3'}` "
+        )
     ).tag(config=True)
 
     def __init__(self, config=None, parent=None, **kwargs):
         """
-        Manages a set of selection cuts on the same input quantity or class.
-
-        Allows one to access the current set of cuts as a Container  or a boolean value
-        (so the results can be output per event if necessary)
-        
-        Parameters
-        ----------
-        name : str
-            name of this set of cuts
-        selector_functions: OrderedDict[str, str]
-            dictionary of "cut name" to acceptance function string. 
-            The acceptance functions are string representation of a lambda
-            function and return True if the input value is *accepted*
+        Manages a set of selection criteria that operate on the same type of input.
+        Each time it is called, it returns a boolean array of whether or not each
+        criterion passed.
         """
         super().__init__(config=config, parent=parent, **kwargs)
 
+        # add a selection to count all entries and make it the first one
+        selection_functions = OrderedDict(self.selection_functions)
+        selection_functions["TOTAL"] = "lambda x: True"
+        selection_functions.move_to_end("TOTAL", last=False)
+        self.selection_functions = selection_functions  # update
+
+        # generate real functions from the selection function strings
         self._selectors = OrderedDict(
-            (name, eval(func_str))
-            for name, func_str in self.selection_functions.items()
+            (name, eval(func_str)) for name, func_str in selection_functions.items()
         )
 
-        self._counts_total = 0
+        # arrays for recording overall statistics
         self._counts = np.zeros(len(self._selectors), dtype=np.int)
         self._counts_weighted = np.zeros(len(self._selectors), dtype=np.int)
 
@@ -95,7 +170,7 @@ class DataChecker(Component):
 
     @property
     def selection_function_strings(self):
-        return list(self.selection_functions.keys())
+        return list(self.selection_functions.values())
 
     @property
     def counts(self):
@@ -107,20 +182,37 @@ class DataChecker(Component):
         """ return a dictionary of the current weighted counts for each selection"""
         return dict(zip(self._selectors.keys(), self._counts_weighted))
 
-    def to_table(self):
+    def to_table(self, functions=False):
+        """ Return a tabular view of the latest quality summary"""
         from astropy.table import Table
 
         keys = list(self.counts.keys())
         vals = list(self.counts.values())
         vals_w = list(self.counts_weighted.values())
-        return Table({"criteria": keys, "counts": vals, "counts_weighted": vals_w})
+        cols = {"criteria": keys, "counts": vals, "counts_weighted": vals_w}
+        if functions:
+            cols["func"] = self.selection_function_strings
+        return Table(cols)
 
     def _repr_html_(self):
         return self.to_table()._repr_html_()
 
     def __call__(self, value, weight=1):
-        """ test that value passes all cuts in """
-        self._counts_total += 1
+        """
+        Test that value passes all cuts
+
+        Parameters
+        ----------
+        value:
+            the value to pass to each selection function
+        weight: float
+            a weight to apply for weighted statistics
+
+        Returns
+        -------
+        np.ndarray:
+            array of booleans with results of each selection criterion in order
+        """
         result = np.array(list(map(lambda f: f(value), self._selectors.values())))
         self._counts += result.astype(int)
         self._counts_weighted += result.astype(int) * weight
@@ -164,7 +256,10 @@ def create_tel_id_to_tel_index_transform(sub):
 
 class ImageCleaner(Component):
     """
-    Apply Image Cleaning    
+    Apply Image Cleaning
+
+    # TODO: make TelParamDict trait type that allows one to set these parameters by
+    # telescope type name
     """
 
     method = CaselessStrEnum(
@@ -224,14 +319,12 @@ class Stage1Process(Tool):
         help="Store DL1/Event/Image data in output", default_value=False
     ).tag(config=True)
 
-    aliases = Dict(
-        {
-            "input": "Stage1Process.input_filename",
-            "output": "Stage1Process.output_filename",
-            "allowed-tels": "EventSource.allowed_tels",
-            "max-events": "EventSource.max_events",
-        }
-    )
+    aliases = {
+        "input": "Stage1Process.input_filename",
+        "output": "Stage1Process.output_filename",
+        "allowed-tels": "EventSource.allowed_tels",
+        "max-events": "EventSource.max_events",
+    }
 
     flags = {
         "write-images": (
@@ -281,7 +374,7 @@ class Stage1Process(Tool):
             fletcher32=True,  # attach a checksum to each chunk for error correction
         )
 
-    def write_simulation_configuration(self, event, writer):
+    def _write_simulation_configuration(self, writer, event):
         """
         Write the simulation headers to a single row of a table. Later 
         if this file is merged with others, that table will grow. 
@@ -294,14 +387,13 @@ class Stage1Process(Tool):
             obs_id = Field(0, "MC Run Identifier")
 
         extramc = ExtraMCInfo()
-
         extramc.obs_id = event.dl0.obs_id
         writer.write("simulation/run_config", [extramc, event.mcheader])
 
-    def write_simulation_histograms(self):
+    def _write_simulation_histograms(self, writer):
         self.log.debug("Writing simulation histograms")
 
-    def write_instrument_configuration(self, subarray):
+    def _write_instrument_configuration(self, subarray):
         """write the SubarrayDescription
         
         Parameters
@@ -326,7 +418,6 @@ class Stage1Process(Tool):
         )
         for telescope_type in subarray.telescope_types:
             ids = set(subarray.get_tel_ids_for_type(telescope_type))
-            print(f"{telescope_type}: {len(ids)}")
             if len(ids) > 0:  # only write if there is a telescope with this camera
                 tel_id = list(ids)[0]
                 camera = subarray.tel[tel_id].camera
@@ -337,7 +428,7 @@ class Stage1Process(Tool):
                     serialize_meta=serialize_meta,
                 )
 
-    def parameterize_image(
+    def _parameterize_image(
         self, telescope: TelescopeDescription, data: DL1CameraContainer
     ):
         """Apply Image Cleaning
@@ -371,12 +462,13 @@ class Stage1Process(Tool):
             "image_criteria: %s",
             list(zip(self.check_image.criteria_names, image_criteria)),
         )
+
+        # parameterize the event if all criteria pass:
         if all(image_criteria):
-            # parameterize
             params.hillas = hillas_parameters(geom=telescope.camera, image=clean_image)
             params.timing = timing_parameters(
                 geom=telescope.camera,
-                image=data.image,
+                image=clean_image,
                 pulse_time=data.pulse_time,
                 hillas_parameters=params.hillas,
             )
@@ -391,123 +483,132 @@ class Stage1Process(Tool):
 
         return clean_image, params
 
-    def write_events(self):
+    def _process_events(self, writer):
         self.log.debug("Writing DL1/Event data")
         tel_index = TelEventIndexContainer()
         event_index = EventIndexContainer()
 
-        with HDF5TableWriter(
-            self.output_filename,
-            group_name="dl1",
-            mode="a",
-            add_prefix=True,
-            filters=self._hdf5_filters,
-        ) as writer:
+        for event in self.event_source:
+            self.log.debug("Writing event_id=%s", event.dl0.event_id)
 
-            for event in self.event_source:
-                self.log.debug("Writing event_id=%s", event.dl0.event_id)
+            self.calibrate(event)
 
-                self.calibrate(event)
+            event.mc.prefix = "mc"
+            event.trig.prefix = ""
+            event_index.event_id = event.dl0.event_id
+            event_index.obs_id = event.dl0.obs_id
+            tel_index.event_id = event.dl0.event_id
+            tel_index.obs_id = event.dl0.obs_id
 
-                event.mc.prefix = "mc"
-                event.trig.prefix = ""
-                event_index.event_id = event.dl0.event_id
-                event_index.obs_id = event.dl0.obs_id
-                tel_index.event_id = event.dl0.event_id
-                tel_index.obs_id = event.dl0.obs_id
-
-                # On the first event, we now have a subarray loaded, and other info, so
-                # we can write the configuration data.
-                if event.count == 0:
-                    tel_list_transform = create_tel_id_to_tel_index_transform(
-                        event.inst.subarray
-                    )
-                    writer.add_column_transform(
-                        table_name="event/subarray/trigger",
-                        col_name="tels_with_trigger",
-                        transform=tel_list_transform,
-                    )
-                    self.write_simulation_configuration(event, writer)
-                    self.write_instrument_configuration(event.inst.subarray)
-
-                # write the subarray tables
-                writer.write(
-                    table_name="event/subarray/mc_shower",
-                    containers=[event_index, event.mc],
+            # On the first event, we now have a subarray loaded, and other info, so
+            # we can write the configuration data.
+            if event.count == 0:
+                tel_list_transform = create_tel_id_to_tel_index_transform(
+                    event.inst.subarray
                 )
+                writer.add_column_transform(
+                    table_name="dl1/event/subarray/trigger",
+                    col_name="tels_with_trigger",
+                    transform=tel_list_transform,
+                )
+                self.subarray = event.inst.subarray
+                event.inst.subarray.info(printer=self.log.debug)
+                self._write_simulation_configuration(writer, event)
+                self._write_instrument_configuration(event.inst.subarray)
+
+            # write the subarray tables
+            writer.write(
+                table_name="dl1/event/subarray/mc_shower",
+                containers=[event_index, event.mc],
+            )
+            writer.write(
+                table_name="dl1/event/subarray/trigger",
+                containers=[event_index, event.trig],
+            )
+            # write the telescope tables
+            self._write_telescope_event(writer, event, tel_index)
+
+    def _write_telescope_event(self, writer, event, tel_index):
+        """
+        add entries to the event/telescope tables for each telescope in a single
+        event
+        """
+
+        # write the telescope tables
+        for tel_id, data in event.dl1.tel.items():
+
+            telescope = event.inst.subarray.tel[tel_id]
+            tel_type = str(telescope)
+            tel_index.tel_id = tel_id
+            tel_index.tel_type_id = hash(tel_type)
+
+            image_mask, params = self._parameterize_image(telescope, data)
+
+            self.log.debug("params: %s", params.as_dict(recursive=True))
+
+            if params.hillas.intensity is np.nan:
+                # TODO: dont' do this in the future! But right now, the HDF5TableWriter
+                # has problems if the first event has NaN as a value, since it can't
+                # infer the type.
+                continue
+
+            self.log.debug("Writing! ******")
+
+            containers_to_write = [
+                tel_index,
+                params.hillas,
+                params.timing,
+                params.leakage,
+                params.concentration,
+            ]
+
+            data.prefix = ""  # don't want a prefix for this container
+
+            if self.write_images:
                 writer.write(
-                    table_name="event/subarray/trigger",
-                    containers=[event_index, event.trig],
+                    table_name=f"dl1/event/telescope/image/{tel_type}",
+                    containers=[tel_index, event.dl0, data],
                 )
 
-                # write the telescope tables
-                for tel_id, data in event.dl1.tel.items():
+            writer.write(
+                table_name=f"dl1/event/telescope/parameters",
+                containers=containers_to_write,
+            )
 
-                    telescope = event.inst.subarray.tel[tel_id]
-                    tel_type = str(telescope)
-                    tel_index.tel_id = tel_id
-                    tel_index.tel_type_id = hash(tel_type)
-
-                    image_mask, params = self.parameterize_image(telescope, data)
-
-                    self.log.debug("params: %s", params.as_dict(recursive=True))
-
-                    if params.hillas.intensity is np.nan:
-                        # TODO: dont' do this in the future! But right now, the HDF5TableWriter
-                        # has problems if the first event has NaN as a value, since it can't
-                        # infer the type.
-                        continue
-
-                    self.log.debug("Writing! ******")
-
-                    containers_to_write = [
-                        tel_index,
-                        params.hillas,
-                        params.timing,
-                        params.leakage,
-                        params.concentration,
-                    ]
-
-                    data.prefix = ""  # don't want a prefix for this container
-                    # extra_im.tel_id = tel_id
-
-                    if self.write_images:
-                        writer.write(
-                            table_name=f"event/telescope/image/{tel_type}",
-                            containers=[tel_index, event.dl0, data],
-                        )
-
-                    writer.write(
-                        table_name=f"event/telescope/parameters",
-                        containers=containers_to_write,
-                    )
-
-    def generate_indices(self):
+    def _generate_indices(self, writer: HDF5TableWriter):
         import itertools
 
-        with tables.open_file(self.input_filename, mode="a") as h5file:
-            for node in itertools.chain(
-                h5file.iter_nodes("/dl1/event/telescope"),
-                h5file.iter_nodes("/dl1/event/subarray"),
-            ):
-                if isinstance(node, tables.group.Group):
-                    pass
-                else:
-                    if "event_id" in node.colnames:
-                        node.cols.event_id.create_index()
-                        self.log.debug("generated event_id index")
-                    if "tel_id" in node.colnames:
-                        node.cols.tel_id.create_index()
-                        self.log.debug("generated tel_id index")
-                    if "obs_id" in node.colnames:
-                        self.log.debug("generated obs_id index")
-                        node.cols.obs_id.create_index(kind="ultralight")
+        h5file = writer._h5file
+
+        for node in itertools.chain(
+            h5file.iter_nodes("/dl1/event/telescope"),
+            h5file.iter_nodes("/dl1/event/subarray"),
+        ):
+            if isinstance(node, tables.group.Group):
+                pass
+            else:
+                if "event_id" in node.colnames:
+                    node.cols.event_id.create_index()
+                    self.log.debug("generated event_id index")
+                if "tel_id" in node.colnames:
+                    node.cols.tel_id.create_index()
+                    self.log.debug("generated tel_id index")
+                if "obs_id" in node.colnames:
+                    self.log.debug("generated obs_id index")
+                    node.cols.obs_id.create_index(kind="ultralight")
 
     def start(self):
 
-        self.write_events()
-        self.generate_indices()
-        self.write_simulation_histograms()
+        with HDF5TableWriter(
+            self.output_filename, mode="a", add_prefix=True, filters=self._hdf5_filters
+        ) as writer:
+
+            self._process_events(writer)
+            self._write_simulation_histograms(writer)
+            # self._generate_indices(writer)
+
+    def finish(self):
+        pass
 
 
 if __name__ == "__main__":
