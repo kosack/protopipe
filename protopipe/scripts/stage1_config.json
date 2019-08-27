@@ -1,18 +1,15 @@
 {
     "Stage1Process": {
         "config_file": "",
-        "input_filename": "/Users/kkosack/Data/CTA/Prod3b/gamma/gamma_20deg_0deg_run101___cta-prod3_desert-2150m-Paranal-merged.simtel.gz",
-        "log_datefmt": "%Y-%m-%d %H:%M:%S",
-        "log_format": "%(levelname)s [%(name)s] (%(module)s/%(funcName)s): %(message)s",
-        "log_level": 20,
         "output_filename": "dl1_events.h5",
-        "write_images": false
+        "write_images": false,
+        "compression_level": 0
     },
     "EventSource": {
         "allowed_tels": [],
         "back_seekable": false,
         "input_url": "~/Data/CTA/Prod3b/gamma/gamma_20deg_0deg_run101___cta-prod3_desert-2150m-Paranal-merged.simtel.gz",
-        "max_events": 0,
+        "max_events": 100,
         "skip_calibration_events": true
     },
     "CameraCalibrator": {},

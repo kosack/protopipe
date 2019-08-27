@@ -3,6 +3,7 @@ Tool to process  {R0,R1,DL0}/Event data into DL1/Event data
 """
 from collections import OrderedDict, namedtuple
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import tables.filters
@@ -22,7 +23,11 @@ from ctapipe.io.containers import (
     ImageParametersContainer,
     TelEventIndexContainer,
 )
+import tqdm
 
+from ctapipe.core import Provenance
+
+PROV = Provenance()
 RangeTuple = namedtuple("RangeTuple", "min,max")
 
 
@@ -85,9 +90,7 @@ class TelescopeParameter(traitlets.Dict):
 
 class TelescopeParameterResolver:
     def __init__(
-        self,
-        subarray: "ctapipe.instrument.SubarrayDescription",
-        tel_param: TelescopeParameter,
+        self, subarray: "ctapipe.instrument.SubarrayDescription", tel_param: dict
     ):
         """
         Handles looking up a parameter by telescope_id, given a TelescopeParameter
@@ -100,7 +103,7 @@ class TelescopeParameterResolver:
             name of the mapped parameter
         subarray: ctapipe.instrument.SubarrayDescription
             description of the subarray (includes mapping of tel_id to tel_type)
-        tel_param: TelescopeParameter
+        tel_param: TelescopeParameter trait dict
             the parameter definitions as a map of key to value
         """
 
@@ -136,6 +139,11 @@ class TelescopeParameterResolver:
 
 
 class DataChecker(Component):
+    """
+    Manages a set of selection criteria that operate on the same type of input.
+    Each time it is called, it returns a boolean array of whether or not each
+    criterion passed.
+    """
 
     selection_functions = Dict(
         help=(
@@ -145,11 +153,6 @@ class DataChecker(Component):
     ).tag(config=True)
 
     def __init__(self, config=None, parent=None, **kwargs):
-        """
-        Manages a set of selection criteria that operate on the same type of input.
-        Each time it is called, it returns a boolean array of whether or not each
-        criterion passed.
-        """
         super().__init__(config=config, parent=parent, **kwargs)
 
         # add a selection to count all entries and make it the first one
@@ -266,6 +269,7 @@ def create_tel_id_to_tel_index_transform(sub):
 class ImageCleaner(Component):
     pass
 
+
 class TailcutsImageCleaner(ImageCleaner):
     """
     Apply Image Cleaning to a set of telescope images
@@ -292,7 +296,7 @@ class TailcutsImageCleaner(ImageCleaner):
 
         if self._pic_thresh_resolver is None:
             self._pic_thresh_resolver = TelescopeParameterResolver(
-                 subarray, self.picture_threshold_pe
+                subarray, self.picture_threshold_pe
             )
             self._bnd_thresh_resolver = TelescopeParameterResolver(
                 subarray, self.boundary_threshold_pe
@@ -340,9 +344,12 @@ class Stage1Process(Tool):
     output_filename = Unicode(
         help="DL1 output filename", default_value="dl1_events.h5"
     ).tag(config=True)
+
     write_images = Bool(
         help="Store DL1/Event/Image data in output", default_value=False
     ).tag(config=True)
+
+    overwrite = Bool(help="overwrite output file if it exists").tag(config=True)
 
     aliases = {
         "input": "EventSource.input_url",
@@ -355,21 +362,36 @@ class Stage1Process(Tool):
         "write-images": (
             {"Stage1Process": {"write_images": True}},
             "store DL1/Event images in output",
-        )
+        ),
+        "overwrite": (
+            {"Stage1Process": {"overwrite": True}},
+            "Overwrite output file if it exists",
+        ),
     }
+
+    compression_level = Int(
+        help="compression level, 0=None, 9=maximum", default_value=5, min=0, max=9
+    ).tag(config=True)
+    compression_type = CaselessStrEnum(
+        values=["blosc:zstd", "zlib"],
+        help="compressor algorithm to use. ",
+        default_value="zlib",
+    ).tag(config=True)
 
     classes = List([EventSource, CameraCalibrator, ImageCleaner, ImageDataChecker])
 
-    @property
-    def input_filename(self):
-        return self.event_source.input_url()
-
     def setup(self):
 
-        self.event_source = self.add_component(
-            EventSource.from_config(parent=self)
-        )
+        # check output path:
+        output_path = Path(self.output_filename).expanduser()
+        if output_path.exists() and self.overwrite:
+            self.log.warn(f"Overwriting {output_path}")
+            output_path.unlink()
+        PROV.add_output_file(str(output_path), role="DL1/Event")
 
+        # setup components:
+
+        self.event_source = self.add_component(EventSource.from_config(parent=self))
         self.calibrate = self.add_component(CameraCalibrator(parent=self))
         self.clean = self.add_component(TailcutsImageCleaner(parent=self))
 
@@ -395,8 +417,8 @@ class Stage1Process(Tool):
 
         # setup HDF5 compression:
         self._hdf5_filters = tables.Filters(
-            complevel=5,  # enable compression, with level 0=disabled, 9=max
-            complib="blosc:zstd",  #  compression using blosc
+            complevel=self.compression_level,
+            complib=self.compression_type,
             fletcher32=True,  # attach a checksum to each chunk for error correction
         )
 
@@ -514,7 +536,7 @@ class Stage1Process(Tool):
         tel_index = TelEventIndexContainer()
         event_index = EventIndexContainer()
 
-        for event in self.event_source:
+        for event in tqdm.tqdm(self.event_source, total=self.event_source.max_events):
             self.log.debug("Writing event_id=%s", event.dl0.event_id)
 
             self.calibrate(event)
