@@ -96,6 +96,8 @@ class TelescopeParameterResolver:
 
         Parameters
         ----------
+        name: str
+            name of the mapped parameter
         subarray: ctapipe.instrument.SubarrayDescription
             description of the subarray (includes mapping of tel_id to tel_type)
         tel_param: TelescopeParameter
@@ -123,7 +125,14 @@ class TelescopeParameterResolver:
         """
         returns the resolved parameter for the given telescope id
         """
-        return self._value_for_tel_id[tel_id]
+        try:
+            return self._value_for_tel_id[tel_id]
+        except KeyError as err:
+            raise KeyError(
+                f"TelescopeParameterResolver: no "
+                f"parameter value was set for telescope with tel_id="
+                f"{tel_id}. Please set it explicity, or by telescope type or '*'."
+            )
 
 
 class DataChecker(Component):
@@ -255,63 +264,79 @@ def create_tel_id_to_tel_index_transform(sub):
 
 
 class ImageCleaner(Component):
-    """
-    Apply Image Cleaning
+    pass
 
-    # TODO: make TelParamDict trait type that allows one to set these parameters by
-    # telescope type name
+class TailcutsImageCleaner(ImageCleaner):
+    """
+    Apply Image Cleaning to a set of telescope images
     """
 
-    method = CaselessStrEnum(
-        ["tailcuts-standard", "tailcuts-mars"],
-        help="Image Cleaning Method to use",
-        default_value="tailcuts-standard",
+    picture_threshold_pe = TelescopeParameter(
+        help="top-level threshold in photoelectrons", default_value={"*": 10.0}
     ).tag(config=True)
 
-    picture_threshold_pe = Float(
-        help="top-level threshold in photoelectrons", default_value=10.0
-    ).tag(config=True)
-
-    boundary_threshold_pe = Float(
-        help="second-level threshold in photoelectrons", default_value=5.0
+    boundary_threshold_pe = TelescopeParameter(
+        help="second-level threshold in photoelectrons", default_value={"*": 5.0}
     ).tag(config=True)
 
     min_picture_neighbors = Int(
         help="Minimum number of neighbors above threshold to consider", default_value=2
     ).tag(config=True)
 
-    def _apply_tailcuts_standard(self, geom, image):
+    def __init__(self, config=None, parent=None, **kwargs):
+        super().__init__(config, parent, **kwargs)
+        self._pic_thresh_resolver = None
+        self._bnd_thresh_resolver = None
+
+    def _apply_tailcuts_standard(self, subarray, image, tel_id):
+
+        if self._pic_thresh_resolver is None:
+            self._pic_thresh_resolver = TelescopeParameterResolver(
+                 subarray, self.picture_threshold_pe
+            )
+            self._bnd_thresh_resolver = TelescopeParameterResolver(
+                subarray, self.boundary_threshold_pe
+            )
+
         return tailcuts_clean(
-            geom,
+            subarray.tel[tel_id].camera,
             image,
-            picture_thresh=self.picture_threshold_pe,
-            boundary_thresh=self.boundary_threshold_pe,
+            picture_thresh=self._pic_thresh_resolver.value_for_tel_id(tel_id),
+            boundary_thresh=self._bnd_thresh_resolver.value_for_tel_id(tel_id),
             min_number_picture_neighbors=self.min_picture_neighbors,
         )
 
-    def __call__(self, geom: "CameraGeometry", image: np.ndarray):
+    def __call__(
+        self,
+        tel_id: int,
+        subarray: "ctapipe.instrument.SubarrayDescription",
+        image: np.ndarray,
+    ):
         """ Apply image cleaning
         
         Parameters
         ----------
-        geom : CameraGeometry
+        geom : ctapipe.image.CameraGeometry
             geometry definition of the camera
         image : np.ndarray
-            image pixel data corresponding to the camera geometry 
+            image pixel data corresponding to the camera geometry
+        subarray: ctapipe.image.SubarrayDescription
+            subarray definition (for mapping tel type to tel_id)
+        tel_id:
+            tel_id so we know which cut to use
         
         Returns
         -------
         np.ndarray
             boolean mask of pixels passing cleaning
         """
-        return self._apply_tailcuts_standard(geom, image)
+        return self._apply_tailcuts_standard(subarray, image, tel_id)
 
 
 class Stage1Process(Tool):
     name = "ctapipe-stage1-process"
     description = "process R0,R1,DL0 inputs into DL1 outputs"
 
-    input_filename = Unicode(help="DL0 input filename").tag(config=True)
     output_filename = Unicode(
         help="DL1 output filename", default_value="dl1_events.h5"
     ).tag(config=True)
@@ -320,7 +345,7 @@ class Stage1Process(Tool):
     ).tag(config=True)
 
     aliases = {
-        "input": "Stage1Process.input_filename",
+        "input": "EventSource.input_url",
         "output": "Stage1Process.output_filename",
         "allowed-tels": "EventSource.allowed_tels",
         "max-events": "EventSource.max_events",
@@ -335,17 +360,18 @@ class Stage1Process(Tool):
 
     classes = List([EventSource, CameraCalibrator, ImageCleaner, ImageDataChecker])
 
+    @property
+    def input_filename(self):
+        return self.event_source.input_url()
+
     def setup(self):
 
-        if self.input_filename == "":
-            raise ToolConfigurationError("Please specify --input <DL0/Events file>")
-
         self.event_source = self.add_component(
-            EventSource.from_url(self.input_filename, parent=self)
+            EventSource.from_config(parent=self)
         )
 
         self.calibrate = self.add_component(CameraCalibrator(parent=self))
-        self.clean = self.add_component(ImageCleaner(parent=self))
+        self.clean = self.add_component(TailcutsImageCleaner(parent=self))
 
         # TODO: eventually configure this from file
         self.check_image = self.add_component(
@@ -428,17 +454,17 @@ class Stage1Process(Tool):
                     serialize_meta=serialize_meta,
                 )
 
-    def _parameterize_image(
-        self, telescope: TelescopeDescription, data: DL1CameraContainer
-    ):
+    def _parameterize_image(self, subarray, data, tel_id):
         """Apply Image Cleaning
        
         Parameters
         ----------
-        telescope : TelescopeDescription
-           telescope description
+        subarray : SubarrayDescription
+           subarray description
         data : DL1CameraContainer
             calibrated camera data
+        tel_id: int
+            which telescope is being cleaned
         
         Returns
         -------
@@ -446,9 +472,11 @@ class Stage1Process(Tool):
             cleaning mask, parameters
         """
 
+        tel = subarray.tel[tel_id]
+
         # apply cleaning
 
-        mask = self.clean(geom=telescope.camera, image=data.image)
+        mask = self.clean(subarray=subarray, image=data.image, tel_id=tel_id)
 
         clean_image = data.image.copy()
         clean_image[~mask] = 0
@@ -465,20 +493,18 @@ class Stage1Process(Tool):
 
         # parameterize the event if all criteria pass:
         if all(image_criteria):
-            params.hillas = hillas_parameters(geom=telescope.camera, image=clean_image)
+            params.hillas = hillas_parameters(geom=tel.camera, image=clean_image)
             params.timing = timing_parameters(
-                geom=telescope.camera,
+                geom=tel.camera,
                 image=clean_image,
                 pulse_time=data.pulse_time,
                 hillas_parameters=params.hillas,
             )
             params.leakage = leakage(
-                geom=telescope.camera, image=data.image, cleaning_mask=mask
+                geom=tel.camera, image=data.image, cleaning_mask=mask
             )
             params.concentration = concentration(
-                geom=telescope.camera,
-                image=clean_image,
-                hillas_parameters=params.hillas,
+                geom=tel.camera, image=clean_image, hillas_parameters=params.hillas
             )
 
         return clean_image, params
@@ -542,7 +568,9 @@ class Stage1Process(Tool):
             tel_index.tel_id = tel_id
             tel_index.tel_type_id = hash(tel_type)
 
-            image_mask, params = self._parameterize_image(telescope, data)
+            image_mask, params = self._parameterize_image(
+                event.inst.subarray, data, tel_id=tel_id
+            )
 
             self.log.debug("params: %s", params.as_dict(recursive=True))
 
