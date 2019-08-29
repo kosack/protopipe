@@ -15,20 +15,39 @@ from ctapipe.image import hillas_parameters, tailcuts_clean
 from ctapipe.image.concentration import concentration
 from ctapipe.image.leakage import leakage
 from ctapipe.image.timing_parameters import timing_parameters
-from ctapipe.instrument import CameraGeometry, TelescopeDescription
-from ctapipe.io import EventSource, HDF5TableWriter
+from ctapipe.io import EventSource, HDF5TableWriter, SimTelEventSource
 from ctapipe.io.containers import (
     DL1CameraContainer,
     EventIndexContainer,
     ImageParametersContainer,
     TelEventIndexContainer,
+    SimulatedShowerDistribution,
 )
-import tqdm
+from tqdm.autonotebook import tqdm
 
 from ctapipe.core import Provenance
+import hashlib
 
 PROV = Provenance()
 RangeTuple = namedtuple("RangeTuple", "min,max")
+
+
+def tel_type_string_to_int(tel_type):
+    """
+    convert a telescope type string (str(TelescopeDescription)) into an integer that
+    can be stored.
+
+    Parameters
+    ----------
+    tel_type: str
+        telescope type string like "SST_ASTRI_CHEC"
+
+    Returns
+    -------
+    int:
+        hash value
+    """
+    return int(hashlib.sha1(tel_type.encode("utf8")).hexdigest(), 16) % (10 ** 8)
 
 
 class TelescopeParameter(traitlets.Dict):
@@ -81,7 +100,7 @@ class TelescopeParameter(traitlets.Dict):
                     tel_id = int(tokens[1])  # will fail if not parsable
                 except ValueError as err:
                     raise traitlets.TraitError(
-                        f"couldn't parse telescope id '{tokens[1]}'"
+                        f"Couldn't parse telescope id '{tokens[1]}': {err}"
                     )
 
             value[key] = float(val)
@@ -130,7 +149,7 @@ class TelescopeParameterResolver:
         """
         try:
             return self._value_for_tel_id[tel_id]
-        except KeyError as err:
+        except KeyError:
             raise KeyError(
                 f"TelescopeParameterResolver: no "
                 f"parameter value was set for telescope with tel_id="
@@ -247,6 +266,9 @@ def expand_tel_list(tel_list, max_tels, index_map):
     """
     un-pack var-length list of tel_ids into 
     fixed-width bit pattern by tel_index
+
+    TODO: use index_map to index by tel_index rather than tel_id so this can be a
+    shorter array of bools.
     """
     pattern = np.zeros(max_tels).astype(bool)
     pattern[tel_list] = 1
@@ -320,14 +342,13 @@ class TailcutsImageCleaner(ImageCleaner):
         
         Parameters
         ----------
-        geom : ctapipe.image.CameraGeometry
-            geometry definition of the camera
+        tel_id: int
+            which telescope id in the subarray is being used (determines
+            which cut is used)
         image : np.ndarray
             image pixel data corresponding to the camera geometry
         subarray: ctapipe.image.SubarrayDescription
             subarray definition (for mapping tel type to tel_id)
-        tel_id:
-            tel_id so we know which cut to use
         
         Returns
         -------
@@ -349,7 +370,17 @@ class Stage1Process(Tool):
         help="Store DL1/Event/Image data in output", default_value=False
     ).tag(config=True)
 
+    compression_level = Int(
+        help="compression level, 0=None, 9=maximum", default_value=5, min=0, max=9
+    ).tag(config=True)
+    compression_type = CaselessStrEnum(
+        values=["blosc:zstd", "zlib"],
+        help="compressor algorithm to use. ",
+        default_value="zlib",
+    ).tag(config=True)
+
     overwrite = Bool(help="overwrite output file if it exists").tag(config=True)
+    progress_bar = Bool(help="show progress bar during processing").tag(config=True)
 
     aliases = {
         "input": "EventSource.input_url",
@@ -367,18 +398,13 @@ class Stage1Process(Tool):
             {"Stage1Process": {"overwrite": True}},
             "Overwrite output file if it exists",
         ),
+        "progress": (
+            {"Stage1Process": {"progress_bar": True}},
+            "show a progress bar during event processing",
+        ),
     }
 
-    compression_level = Int(
-        help="compression level, 0=None, 9=maximum", default_value=5, min=0, max=9
-    ).tag(config=True)
-    compression_type = CaselessStrEnum(
-        values=["blosc:zstd", "zlib"],
-        help="compressor algorithm to use. ",
-        default_value="zlib",
-    ).tag(config=True)
-
-    classes = List([EventSource, CameraCalibrator, ImageCleaner, ImageDataChecker])
+    classes = [EventSource, CameraCalibrator, ImageCleaner, ImageDataChecker]
 
     def setup(self):
 
@@ -438,8 +464,55 @@ class Stage1Process(Tool):
         extramc.obs_id = event.dl0.obs_id
         writer.write("simulation/run_config", [extramc, event.mcheader])
 
-    def _write_simulation_histograms(self, writer):
+    def _write_simulation_histograms(self, writer: HDF5TableWriter):
+        """ Write the distribution of thrown showers
+
+        Notes
+        -----
+        - this only runs if this is a simulation file. The current implementation is
+          a bit of a hack and implies we should improve SimTelEventSource to read this
+          info.
+        - Currently the histograms are at the end of the simtel file, so if max_events
+          is set to non-zero, the end of the file may not be read, and this no
+          histograms will be found.
+        """
         self.log.debug("Writing simulation histograms")
+
+        def fill_from_simtel(eventio_hist, container: SimulatedShowerDistribution):
+            """ fill from a SimTel Histogram entry"""
+            container.hist_id = eventio_hist["id"]
+            container.num_entries = eventio_hist["entries"]
+            xbins = np.linspace(
+                eventio_hist["lower_x"],
+                eventio_hist["upper_x"],
+                eventio_hist["n_bins_x"] + 1,
+            )
+            ybins = np.linspace(
+                eventio_hist["lower_y"],
+                eventio_hist["upper_y"],
+                eventio_hist["n_bins_y"] + 1,
+            )
+            container.bins_core_dist = xbins
+            self.bins_energy = 10 ** ybins
+            container.histogram = eventio_hist["data"]
+            container.meta["hist_title"] = eventio_hist["title"]
+            container.meta["x_label"] = "Log10 E (TeV)"
+            container.meta["y_label"] = "3D Core Distance (m)"
+
+        if type(self.event_source) is not SimTelEventSource:
+            return
+
+        hists = self.event_source.file_.histograms
+        if hists is not None:
+            hist_container = SimulatedShowerDistribution()
+            hist_container.prefix = ""
+            for hist in hists:
+                if hist["id"] == 6:
+                    fill_from_simtel(hist, hist_container)
+                    writer.write(
+                        table_name="simulation/shower_distribution",
+                        containers=hist_container,
+                    )
 
     def _write_instrument_configuration(self, subarray):
         """write the SubarrayDescription
@@ -536,8 +609,15 @@ class Stage1Process(Tool):
         tel_index = TelEventIndexContainer()
         event_index = EventIndexContainer()
 
-        for event in tqdm.tqdm(self.event_source, total=self.event_source.max_events):
-            self.log.debug("Writing event_id=%s", event.dl0.event_id)
+        for event in tqdm(
+            self.event_source,
+            desc=self.event_source.__class__.__name__,
+            total=self.event_source.max_events,
+            unit="event",
+            disable=not self.progress_bar,
+        ):
+
+            self.log.log(9, "Writing event_id=%s", event.dl0.event_id)
 
             self.calibrate(event)
 
@@ -588,7 +668,7 @@ class Stage1Process(Tool):
             telescope = event.inst.subarray.tel[tel_id]
             tel_type = str(telescope)
             tel_index.tel_id = tel_id
-            tel_index.tel_type_id = hash(tel_type)
+            tel_index.tel_type_id = tel_type_string_to_int(tel_type)
 
             image_mask, params = self._parameterize_image(
                 event.inst.subarray, data, tel_id=tel_id
@@ -616,7 +696,7 @@ class Stage1Process(Tool):
 
             if self.write_images:
                 writer.write(
-                    table_name=f"dl1/event/telescope/image/{tel_type}",
+                    table_name=f"dl1/event/telescope/images/{tel_type}",
                     containers=[tel_index, event.dl0, data],
                 )
 
@@ -625,18 +705,11 @@ class Stage1Process(Tool):
                 containers=containers_to_write,
             )
 
-    def _generate_indices(self, writer: HDF5TableWriter):
-        import itertools
+    def _generate_table_indices(self, h5file, start_node):
 
-        h5file = writer._h5file
-
-        for node in itertools.chain(
-            h5file.iter_nodes("/dl1/event/telescope"),
-            h5file.iter_nodes("/dl1/event/subarray"),
-        ):
-            if isinstance(node, tables.group.Group):
-                pass
-            else:
+        for node in h5file.iter_nodes(start_node):
+            if not isinstance(node, tables.group.Group):
+                self.log.debug(f"gen indices for: {node}")
                 if "event_id" in node.colnames:
                     node.cols.event_id.create_index()
                     self.log.debug("generated event_id index")
@@ -646,6 +719,15 @@ class Stage1Process(Tool):
                 if "obs_id" in node.colnames:
                     self.log.debug("generated obs_id index")
                     node.cols.obs_id.create_index(kind="ultralight")
+            else:
+                # recurse
+                self._generate_table_indices(writer, node)
+
+    def _generate_indices(self,):
+        h5file = tables.open_file(self.output_filename, mode="a")
+        self._generate_table_indices(h5file, "/dl1/event/telescope/images")
+        # self._generate_table_indices(writer, "/dl1/event/subarray")
+        h5file.close()
 
     def start(self):
 
@@ -655,7 +737,8 @@ class Stage1Process(Tool):
 
             self._process_events(writer)
             self._write_simulation_histograms(writer)
-            # self._generate_indices(writer)
+
+        self._generate_indices()
 
     def finish(self):
         pass
