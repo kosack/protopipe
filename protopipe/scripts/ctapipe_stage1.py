@@ -4,17 +4,29 @@ Tool to process  {R0,R1,DL0}/Event data into DL1/Event data
 from collections import OrderedDict, namedtuple
 from functools import partial
 from pathlib import Path
+from os.path import expandvars
 
 import numpy as np
 import tables.filters
 import traitlets
-from ctapipe.calib.camera import CameraCalibrator
+from ctapipe.calib.camera import CameraCalibrator, GainSelector
 from ctapipe.core import Component, Container, Field, Tool, ToolConfigurationError
-from ctapipe.core.traits import Bool, CaselessStrEnum, Dict, Float, Int, List, Unicode
-from ctapipe.image import hillas_parameters, tailcuts_clean
+from ctapipe.core.traits import (
+    Bool,
+    CaselessStrEnum,
+    Dict,
+    Float,
+    Int,
+    List,
+    Unicode,
+    enum_trait,
+    classes_with_traits,
+)
+from ctapipe.image import hillas_parameters, tailcuts_clean, number_of_islands
 from ctapipe.image.concentration import concentration
 from ctapipe.image.leakage import leakage
 from ctapipe.image.timing_parameters import timing_parameters
+from ctapipe.image.extractor import ImageExtractor
 from ctapipe.io import EventSource, HDF5TableWriter, SimTelEventSource
 from ctapipe.io.containers import (
     DL1CameraContainer,
@@ -22,6 +34,7 @@ from ctapipe.io.containers import (
     ImageParametersContainer,
     TelEventIndexContainer,
     SimulatedShowerDistribution,
+    MorphologyContainer,
 )
 from tqdm.autonotebook import tqdm
 
@@ -30,6 +43,44 @@ import hashlib
 
 PROV = Provenance()
 RangeTuple = namedtuple("RangeTuple", "min,max")
+
+
+def morphology(geom, image_mask) -> MorphologyContainer:
+    """
+    Compute image morphology parameters
+    Parameters
+    ----------
+    geom: ctapipe.instrument.camera.CameraGeometry
+        camera description
+    image_mask: np.ndarray(bool)
+        image of pixels surviving cleaning (True=survives)
+    Returns
+    -------
+    MorphologyContainer:
+        parameters related to the morphology
+    """
+
+    num_islands, island_labels = number_of_islands(geom=geom, mask=image_mask)
+
+    return MorphologyContainer(num_pixels=image_mask.sum(), num_islands=num_islands)
+
+
+class IntensityContainer(Container):
+    max = Field(np.nan, "value of pixel with maximum intensity")
+    min = Field(np.nan, "value of pixel with minimum intensity")
+    mean = Field(np.nan, "mean intensity")
+    std = Field(np.nan, "standard deviation of intensity")
+
+
+def intensity_statistics(image):
+    """ return intensity statistics of an image """
+    return IntensityContainer(
+        max=image.max(), min=image[image > 0].min(), mean=image.mean(), std=image.std()
+    )
+
+
+class ExtendedImageParametersContainer(ImageParametersContainer):
+    intensity = Field(IntensityContainer(), "intensity statistics")
 
 
 def tel_type_string_to_int(tel_type):
@@ -47,7 +98,9 @@ def tel_type_string_to_int(tel_type):
     int:
         hash value
     """
-    return int(hashlib.sha1(tel_type.encode("utf8")).hexdigest(), 16) % (10 ** 8)
+    return np.int32(
+        int(hashlib.sha1(tel_type.encode("utf8")).hexdigest(), 16) % (10 ** 8)
+    )
 
 
 class TelescopeParameter(traitlets.Dict):
@@ -363,21 +416,41 @@ class Stage1Process(Tool):
     description = "process R0,R1,DL0 inputs into DL1 outputs"
 
     output_filename = Unicode(
-        help="DL1 output filename", default_value="dl1_events.h5"
+        help="DL1 output filename", default_value="events.dl1.h5"
     ).tag(config=True)
 
     write_images = Bool(
         help="Store DL1/Event/Image data in output", default_value=False
     ).tag(config=True)
 
+    write_parameters = Bool(
+        help="Compute and store image parameters", default_value=True
+    ).tag(config=True)
+
     compression_level = Int(
         help="compression level, 0=None, 9=maximum", default_value=5, min=0, max=9
     ).tag(config=True)
+
     compression_type = CaselessStrEnum(
         values=["blosc:zstd", "zlib"],
         help="compressor algorithm to use. ",
         default_value="zlib",
     ).tag(config=True)
+
+    image_extractor_type = enum_trait(
+        base_class=ImageExtractor,
+        default="NeighborPeakWindowSum",
+        help_str="Method to use to turn a waveform into a single charge value",
+    ).tag(config=True)
+
+    gain_selector_type = enum_trait(
+        base_class=GainSelector, default="ThresholdGainSelector"
+    ).tag(config=True)
+
+    image_cleaner_type = enum_trait(
+        base_class=ImageCleaner,
+        default='TailcutsImageCleaner',
+    )
 
     overwrite = Bool(help="overwrite output file if it exists").tag(config=True)
     progress_bar = Bool(help="show progress bar during processing").tag(config=True)
@@ -387,6 +460,9 @@ class Stage1Process(Tool):
         "output": "Stage1Process.output_filename",
         "allowed-tels": "EventSource.allowed_tels",
         "max-events": "EventSource.max_events",
+        "image-extractor-type": "Stage1Process.image_extractor_type",
+        "gain-selector-type": "Stage1Process.gain_selector_type",
+        "image-cleaner-type": "Stage1Process.image_cleaner_type",
     }
 
     flags = {
@@ -404,32 +480,47 @@ class Stage1Process(Tool):
         ),
     }
 
-    classes = [EventSource, CameraCalibrator, ImageCleaner, ImageDataChecker]
+    classes = List(
+        [EventSource, CameraCalibrator, ImageDataChecker]
+        + classes_with_traits(ImageCleaner)
+        + classes_with_traits(ImageExtractor)
+        + classes_with_traits(GainSelector)
+    )
 
     def setup(self):
 
-        # check output path:
-        output_path = Path(self.output_filename).expanduser()
+        # prepare output path:
+
+        output_path = Path(expandvars(self.output_filename)).expanduser()
         if output_path.exists() and self.overwrite:
             self.log.warn(f"Overwriting {output_path}")
             output_path.unlink()
         PROV.add_output_file(str(output_path), role="DL1/Event")
 
+        # check that options make sense:
+        if self.write_parameters is False and self.write_images is False:
+            raise ToolConfigurationError(
+                "The options 'write_parameters' and 'write_images' are "
+                "both set to False. No output will be generated in that case. "
+                "Please enable one or both of these options."
+            )
+
         # setup components:
 
         self.event_source = self.add_component(EventSource.from_config(parent=self))
-        self.calibrate = self.add_component(CameraCalibrator(parent=self))
-        self.clean = self.add_component(TailcutsImageCleaner(parent=self))
-
-        # TODO: eventually configure this from file
-        self.check_image = self.add_component(
-            ImageDataChecker(
-                selection_functions=dict(
-                    enough_pixels="lambda im: np.count_nonzero(im) > 2",
-                    enough_charge="lambda im: im.sum() > 100",
-                )
-            )
+        self.gain_selector = self.add_component(
+            GainSelector.from_name(self.gain_selector_type, parent=self)
         )
+        self.image_extractor = self.add_component(
+            ImageExtractor.from_name(self.image_extractor_type, parent=self)
+        )
+        self.calibrate = self.add_component(
+            CameraCalibrator(parent=self, image_extractor=self.image_extractor)
+        )
+        self.clean = self.add_component(
+            ImageCleaner.from_name(self.image_cleaner_type, parent=self)
+        )
+        self.check_image = self.add_component(ImageDataChecker(parent=self))
 
         # self.check_image_parameters = DataChecker(
         #     "ParameterSelection",
@@ -458,10 +549,12 @@ class Stage1Process(Tool):
         self.log.debug("Writing simulation configuration")
 
         class ExtraMCInfo(Container):
+            container_prefix = ""
             obs_id = Field(0, "MC Run Identifier")
 
         extramc = ExtraMCInfo()
-        extramc.obs_id = event.dl0.obs_id
+        extramc.obs_id = event.index.obs_id
+        event.mcheader.prefix = ""
         writer.write("simulation/run_config", [extramc, event.mcheader])
 
     def _write_simulation_histograms(self, writer: HDF5TableWriter):
@@ -478,8 +571,11 @@ class Stage1Process(Tool):
         """
         self.log.debug("Writing simulation histograms")
 
-        def fill_from_simtel(eventio_hist, container: SimulatedShowerDistribution):
+        def fill_from_simtel(
+            obs_id, eventio_hist, container: SimulatedShowerDistribution
+        ):
             """ fill from a SimTel Histogram entry"""
+            container.obs_id = obs_id
             container.hist_id = eventio_hist["id"]
             container.num_entries = eventio_hist["entries"]
             xbins = np.linspace(
@@ -508,7 +604,7 @@ class Stage1Process(Tool):
             hist_container.prefix = ""
             for hist in hists:
                 if hist["id"] == 6:
-                    fill_from_simtel(hist, hist_container)
+                    fill_from_simtel(self._cur_obs_id, hist, hist_container)
                     writer.write(
                         table_name="simulation/shower_distribution",
                         containers=hist_container,
@@ -576,7 +672,7 @@ class Stage1Process(Tool):
         clean_image = data.image.copy()
         clean_image[~mask] = 0
 
-        params = ImageParametersContainer()
+        params = ExtendedImageParametersContainer()
 
         # check if image can be parameterized:
 
@@ -601,6 +697,8 @@ class Stage1Process(Tool):
             params.concentration = concentration(
                 geom=tel.camera, image=clean_image, hillas_parameters=params.hillas
             )
+            params.morphology = morphology(geom=tel.camera, image_mask=mask)
+            params.intensity = intensity_statistics(image=clean_image)
 
         return clean_image, params
 
@@ -613,7 +711,7 @@ class Stage1Process(Tool):
             self.event_source,
             desc=self.event_source.__class__.__name__,
             total=self.event_source.max_events,
-            unit="event",
+            unit="ev",
             disable=not self.progress_bar,
         ):
 
@@ -623,10 +721,11 @@ class Stage1Process(Tool):
 
             event.mc.prefix = "mc"
             event.trig.prefix = ""
-            event_index.event_id = event.dl0.event_id
-            event_index.obs_id = event.dl0.obs_id
-            tel_index.event_id = event.dl0.event_id
-            tel_index.obs_id = event.dl0.obs_id
+            event_index.event_id = event.index.event_id
+            event_index.obs_id = event.index.obs_id
+            tel_index.event_id = event.index.event_id
+            tel_index.obs_id = event.index.obs_id
+            self._cur_obs_id = event.index.obs_id
 
             # On the first event, we now have a subarray loaded, and other info, so
             # we can write the configuration data.
@@ -667,43 +766,51 @@ class Stage1Process(Tool):
 
             telescope = event.inst.subarray.tel[tel_id]
             tel_type = str(telescope)
-            tel_index.tel_id = tel_id
+            tel_index.tel_id = np.int16(tel_id)
             tel_index.tel_type_id = tel_type_string_to_int(tel_type)
 
-            image_mask, params = self._parameterize_image(
-                event.inst.subarray, data, tel_id=tel_id
-            )
+            if self.write_parameters:
 
-            self.log.debug("params: %s", params.as_dict(recursive=True))
+                image_mask, params = self._parameterize_image(
+                    event.inst.subarray, data, tel_id=tel_id
+                )
 
-            if params.hillas.intensity is np.nan:
-                # TODO: dont' do this in the future! But right now, the HDF5TableWriter
-                # has problems if the first event has NaN as a value, since it can't
-                # infer the type.
-                continue
+                self.log.debug("params: %s", params.as_dict(recursive=True))
 
-            self.log.debug("Writing! ******")
+                self.log.debug("Writing! ******")
 
-            containers_to_write = [
-                tel_index,
-                params.hillas,
-                params.timing,
-                params.leakage,
-                params.concentration,
-            ]
+                containers_to_write = [
+                    tel_index,
+                    params.hillas,
+                    params.timing,
+                    params.leakage,
+                    params.concentration,
+                    params.morphology,
+                    params.intensity,
+                ]
 
-            data.prefix = ""  # don't want a prefix for this container
+                data.prefix = ""  # don't want a prefix for this container
+
+                # TODO: dont' skip events with no parameters
+                #  currently the HDF5TableWriter has problems if the first event
+                #  has NaN as a value, since it can't infer the data types.
+                #  that implies we need to specify them in the Fields, rather than
+                #  infer from first event, perhaps.  For now we skip them.
+                parameters_were_computed = (
+                    False if params.hillas.intensity is np.nan else True
+                )
+
+                if parameters_were_computed:
+                    writer.write(
+                        table_name=f"dl1/event/telescope/parameters",
+                        containers=containers_to_write,
+                    )
 
             if self.write_images:
                 writer.write(
                     table_name=f"dl1/event/telescope/images/{tel_type}",
-                    containers=[tel_index, event.dl0, data],
+                    containers=[tel_index, data],
                 )
-
-            writer.write(
-                table_name=f"dl1/event/telescope/parameters",
-                containers=containers_to_write,
-            )
 
     def _generate_table_indices(self, h5file, start_node):
 

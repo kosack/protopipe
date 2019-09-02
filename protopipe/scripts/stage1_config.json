@@ -2,14 +2,16 @@
     "Stage1Process": {
         "config_file": "",
         "output_filename": "dl1_events.h5",
-        "write_images": false,
-        "compression_level": 0
+        "overwrite": true,
+        "write_images": true,
+        "image_extractor_type": "NeighborPeakWindowSum",
+        "image_cleaner_type": "TailcutsImageCleaner",
     },
     "EventSource": {
         "allowed_tels": [],
         "back_seekable": false,
-        "input_url": "~/Data/CTA/Prod3b/gamma/gamma_20deg_0deg_run101___cta-prod3_desert-2150m-Paranal-merged.simtel.gz",
-        "max_events": 100,
+        "input_url": "~/Data/CTA/Prod3b/proton/proton_20deg_0deg_run100___cta-prod3_desert-2150m-Paranal-merged.simtel.gz",
+        "max_events": 0,
         "skip_calibration_events": true
     },
     "CameraCalibrator": {},
