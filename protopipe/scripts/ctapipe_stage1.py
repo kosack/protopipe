@@ -1,21 +1,23 @@
 """ 
 Tool to process  {R0,R1,DL0}/Event data into DL1/Event data
 """
-from collections import OrderedDict, namedtuple
+import hashlib
+from collections import namedtuple
 from functools import partial
-from pathlib import Path
 from os.path import expandvars
+from pathlib import Path
 
 import numpy as np
 import tables.filters
 import traitlets
+from astropy import units as u
 from ctapipe.calib.camera import CameraCalibrator, GainSelector
 from ctapipe.core import Component, Container, Field, Tool, ToolConfigurationError
+from ctapipe.core import Provenance
 from ctapipe.core.traits import (
     Bool,
     CaselessStrEnum,
     Dict,
-    Float,
     Int,
     List,
     Unicode,
@@ -24,9 +26,9 @@ from ctapipe.core.traits import (
 )
 from ctapipe.image import hillas_parameters, tailcuts_clean, number_of_islands
 from ctapipe.image.concentration import concentration
+from ctapipe.image.extractor import ImageExtractor
 from ctapipe.image.leakage import leakage
 from ctapipe.image.timing_parameters import timing_parameters
-from ctapipe.image.extractor import ImageExtractor
 from ctapipe.io import EventSource, HDF5TableWriter, SimTelEventSource
 from ctapipe.io.containers import (
     DL1CameraContainer,
@@ -38,11 +40,51 @@ from ctapipe.io.containers import (
 )
 from tqdm.autonotebook import tqdm
 
-from ctapipe.core import Provenance
-import hashlib
-
 PROV = Provenance()
 RangeTuple = namedtuple("RangeTuple", "min,max")
+
+
+def write_core_provenance(output_filename, obs_id, subarray):
+    import uuid
+
+    activity = PROV.current_activity.provenance
+
+    metadata = {
+        "CTA METADATA VERSION ": "2",
+        "CTA CONTACT ORGANIZATION": "CTA Consortium",
+        "CTA CONTACT NAME": "K. Kosack",
+        "CTA CONTACT EMAIL": "karl.kosack@cea.fr",
+        "CTA PRODUCT DESCRIPTION": "DL1 Event List",
+        "CTA PRODUCT CREATION_TIME": "2018-11-10 15:30:00",
+        "CTA PRODUCT ID": str(uuid.uuid4()),
+        "CTA PRODUCT DATA CATEGORY": "MC",
+        "CTA PRODUCT DATA LEVEL": "DL1",
+        "CTA PRODUCT DATA TYPE": "Event",
+        "CTA PRODUCT DATA ASSOCIATION": "Subarray",
+        "CTA PRODUCT DATA MODEL NAME": "DL1/Event",
+        "CTA PRODUCT DATA MODEL VERSION": "v1.0.1",
+        "CTA PRODUCT DATA MODEL URL": "
+        "CTA PRODUCT FORMAT": "hdf5",
+        "CTA PROCESS TYPE": "simulation",
+        "CTA PROCESS SUBTYPE": "",
+        "CTA PROCESS ID": str(obs_id),
+        "CTA ACTIVITY NAME": activity["activity_name"],
+        "CTA ACTIVITY TYPE": "software",
+        "CTA ACTIVITY ID": activity["activity_uuid"],
+        "CTA ACTIVITY START": activity["start"]["time_utc"],
+        "CTA ACTIVITY SOFTWARE NAME": "ctapipe",
+        "CTA ACTIVITY SOFTWARE VERSION": activity["system"]["ctapipe_version"],
+        "CTA INSTRUMENT SITE": "unknown",
+        "CTA INSTRUMENT CLASS": "subarray",
+        "CTA INSTRUMENT TYPE": "",
+        "CTA INSTRUMENT SUBTYPE": "",
+        "CTA INSTRUMENT VERSION": "",
+        "CTA INSTRUMENT ID": str(subarray),
+    }
+
+    with tables.open_file(output_filename, mode="a") as h5file:
+        for key, value in metadata.items():
+            h5file.root._v_attrs[key] = value
 
 
 def morphology(geom, image_mask) -> MorphologyContainer:
@@ -72,7 +114,7 @@ class IntensityContainer(Container):
     std = Field(np.nan, "standard deviation of intensity")
 
 
-def intensity_statistics(image):
+def intensity_statistics(image) -> IntensityContainer:
     """ return intensity statistics of an image """
     return IntensityContainer(
         max=image.max(), min=image[image > 0].min(), mean=image.mean(), std=image.std()
@@ -81,7 +123,20 @@ def intensity_statistics(image):
 
 class ExtendedImageParametersContainer(ImageParametersContainer):
     intensity = Field(IntensityContainer(), "intensity statistics")
+    mc_intensity = Field(IntensityContainer(), "MC intensity statistics")
 
+
+class ExtraImageContainer(Container):
+    """ TODO: fix the MCCameraEventContainer to be things that really change per event
+    to avoid this class"""
+    container_prefix = ""
+
+    mc_photo_electron_image = Field(
+        None,
+        "Monte-carlo image of photo electrons on the " "camera plane, without noise",
+    )
+
+    image_mask = Field(None, "Boolean array of pixels, True=used in parameterization")
 
 def tel_type_string_to_int(tel_type):
     """
@@ -228,25 +283,25 @@ class DataChecker(Component):
         super().__init__(config=config, parent=parent, **kwargs)
 
         # add a selection to count all entries and make it the first one
-        selection_functions = OrderedDict(self.selection_functions)
-        selection_functions["TOTAL"] = "lambda x: True"
-        selection_functions.move_to_end("TOTAL", last=False)
+        selection_functions = {"TOTAL": "lambda x: True"}
+        selection_functions.update(self.selection_functions)
+
         self.selection_functions = selection_functions  # update
 
         # generate real functions from the selection function strings
-        self._selectors = OrderedDict(
-            (name, eval(func_str)) for name, func_str in selection_functions.items()
-        )
+        self._selectors = {
+            name: eval(func_str) for name, func_str in selection_functions.items()
+        }
 
         # arrays for recording overall statistics
         self._counts = np.zeros(len(self._selectors), dtype=np.int)
-        self._counts_weighted = np.zeros(len(self._selectors), dtype=np.int)
+        self._cum_counts = np.zeros(len(self._selectors), dtype=np.int)
 
         # generate a Container that we can use for output somehow...
         self._container = Container()
 
     def __len__(self):
-        return self._counts_total
+        return self._counts[0]
 
     @property
     def criteria_names(self):
@@ -256,24 +311,31 @@ class DataChecker(Component):
     def selection_function_strings(self):
         return list(self.selection_functions.values())
 
-    @property
-    def counts(self):
-        """ return a dictionary of the current counts for each selection"""
-        return dict(zip(self._selectors.keys(), self._counts))
-
-    @property
-    def counts_weighted(self):
-        """ return a dictionary of the current weighted counts for each selection"""
-        return dict(zip(self._selectors.keys(), self._counts_weighted))
-
     def to_table(self, functions=False):
-        """ Return a tabular view of the latest quality summary"""
+        """
+        Return a tabular view of the latest quality summary
+
+        The columns are
+        - *criteria*: name of each criterion
+        - *counts*: counts of each criterion independently
+        - *cum_counts*: counts of cumulative application of each criterion in order
+
+        Parameters
+        ----------
+        functions: bool:
+            include the function string as a column
+
+        Returns
+        -------
+        astropy.table.Table
+        """
         from astropy.table import Table
 
-        keys = list(self.counts.keys())
-        vals = list(self.counts.values())
-        vals_w = list(self.counts_weighted.values())
-        cols = {"criteria": keys, "counts": vals, "counts_weighted": vals_w}
+        cols = {
+            "criteria": self.criteria_names,
+            "counts": self._counts,
+            "cum_counts": self._cum_counts,
+        }
         if functions:
             cols["func"] = self.selection_function_strings
         return Table(cols)
@@ -281,7 +343,7 @@ class DataChecker(Component):
     def _repr_html_(self):
         return self.to_table()._repr_html_()
 
-    def __call__(self, value, weight=1):
+    def __call__(self, value):
         """
         Test that value passes all cuts
 
@@ -289,8 +351,6 @@ class DataChecker(Component):
         ----------
         value:
             the value to pass to each selection function
-        weight: float
-            a weight to apply for weighted statistics
 
         Returns
         -------
@@ -299,7 +359,7 @@ class DataChecker(Component):
         """
         result = np.array(list(map(lambda f: f(value), self._selectors.values())))
         self._counts += result.astype(int)
-        self._counts_weighted += result.astype(int) * weight
+        self._cum_counts += result.cumprod()
         return result
 
 
@@ -448,9 +508,18 @@ class Stage1Process(Tool):
     ).tag(config=True)
 
     image_cleaner_type = enum_trait(
-        base_class=ImageCleaner,
-        default='TailcutsImageCleaner',
+        base_class=ImageCleaner, default="TailcutsImageCleaner"
     )
+
+    write_index_tables = Bool(
+        help=(
+            "Generate PyTables index datasets for all tables that contain an "
+            "event_id or tel_id. These speed up in-kernal pytables operations,"
+            "but add some overhead to the file. They can also be generated "
+            "and attached after the file is written "
+        ),
+        default_value=False,
+    ).tag(config=True)
 
     overwrite = Bool(help="overwrite output file if it exists").tag(config=True)
     progress_bar = Bool(help="show progress bar during processing").tag(config=True)
@@ -468,7 +537,15 @@ class Stage1Process(Tool):
     flags = {
         "write-images": (
             {"Stage1Process": {"write_images": True}},
-            "store DL1/Event images in output",
+            "store DL1/Event/Telescope images in output",
+        ),
+        "write-parameters": (
+            {"Stage1Process": {"write_images": True}},
+            "store DL1/Event/Telescope parameters in output",
+        ),
+        "write-index-tables": (
+            {"Stage1Process": {"write_index_tables": True}},
+            "generate PyTables index tables for the parameter and image datasets",
         ),
         "overwrite": (
             {"Stage1Process": {"overwrite": True}},
@@ -493,7 +570,7 @@ class Stage1Process(Tool):
 
         output_path = Path(expandvars(self.output_filename)).expanduser()
         if output_path.exists() and self.overwrite:
-            self.log.warn(f"Overwriting {output_path}")
+            self.log.warning(f"Overwriting {output_path}")
             output_path.unlink()
         PROV.add_output_file(str(output_path), role="DL1/Event")
 
@@ -508,6 +585,7 @@ class Stage1Process(Tool):
         # setup components:
 
         self.event_source = self.add_component(EventSource.from_config(parent=self))
+
         self.gain_selector = self.add_component(
             GainSelector.from_name(self.gain_selector_type, parent=self)
         )
@@ -522,15 +600,12 @@ class Stage1Process(Tool):
         )
         self.check_image = self.add_component(ImageDataChecker(parent=self))
 
-        # self.check_image_parameters = DataChecker(
-        #     "ParameterSelection",
-        #     OrderedDict(
-        #         good_moments="lambda p: p.hillas.width >= 0 and p.hillas.length >= 0",
-        #         min_ellipticity="lambda p: p.hillas.width/p.hillas.length > 0.1",
-        #         max_ellipticity="lambda p: p.hillas.width/p.hillas.length < 0.6",
-        #         nominal_distance="lambda p: True",  # TODO: implement
-        #     ),
-        # )
+        # check component setup
+        if self.event_source.max_events > 0:
+            self.log.warning(
+                "No Simulated shower distributions will be written because "
+                "EventSource.max_events is set to a non-zero number."
+            )
 
         # setup HDF5 compression:
         self._hdf5_filters = tables.Filters(
@@ -588,8 +663,9 @@ class Stage1Process(Tool):
                 eventio_hist["upper_y"],
                 eventio_hist["n_bins_y"] + 1,
             )
-            container.bins_core_dist = xbins
-            self.bins_energy = 10 ** ybins
+
+            container.bins_core_dist = xbins * u.m
+            container.bins_energy = 10 ** ybins * u.TeV
             container.histogram = eventio_hist["data"]
             container.meta["hist_title"] = eventio_hist["title"]
             container.meta["x_label"] = "Log10 E (TeV)"
@@ -644,6 +720,16 @@ class Stage1Process(Tool):
                     append=True,
                     serialize_meta=serialize_meta,
                 )
+
+    def _write_processing_statistics(self):
+        """ write out the event selection stats, etc. """
+        image_stats = self.check_image.to_table(functions=True)
+        image_stats.write(
+            self.output_filename,
+            path="/dl1/service/image_statistics",
+            append=True,
+            serialize_meta=True,
+        )
 
     def _parameterize_image(self, subarray, data, tel_id):
         """Apply Image Cleaning
@@ -700,12 +786,13 @@ class Stage1Process(Tool):
             params.morphology = morphology(geom=tel.camera, image_mask=mask)
             params.intensity = intensity_statistics(image=clean_image)
 
-        return clean_image, params
+        return mask, params
 
     def _process_events(self, writer):
         self.log.debug("Writing DL1/Event data")
         tel_index = TelEventIndexContainer()
         event_index = EventIndexContainer()
+        is_initialized = False
 
         for event in tqdm(
             self.event_source,
@@ -742,6 +829,7 @@ class Stage1Process(Tool):
                 event.inst.subarray.info(printer=self.log.debug)
                 self._write_simulation_configuration(writer, event)
                 self._write_instrument_configuration(event.inst.subarray)
+                is_initialized = True
 
             # write the subarray tables
             writer.write(
@@ -754,6 +842,9 @@ class Stage1Process(Tool):
             )
             # write the telescope tables
             self._write_telescope_event(writer, event, tel_index)
+
+        if is_initialized is False:
+            raise ValueError(f"No events found in file: {self.event_source.input_url}")
 
     def _write_telescope_event(self, writer, event, tel_index):
         """
@@ -769,6 +860,10 @@ class Stage1Process(Tool):
             tel_index.tel_id = np.int16(tel_id)
             tel_index.tel_type_id = tel_type_string_to_int(tel_type)
 
+            extra = ExtraImageContainer(
+                mc_photo_electron_image=event.mc.tel[tel_id].photo_electron_image,
+            )
+
             if self.write_parameters:
 
                 image_mask, params = self._parameterize_image(
@@ -776,7 +871,6 @@ class Stage1Process(Tool):
                 )
 
                 self.log.debug("params: %s", params.as_dict(recursive=True))
-
                 self.log.debug("Writing! ******")
 
                 containers_to_write = [
@@ -806,10 +900,12 @@ class Stage1Process(Tool):
                         containers=containers_to_write,
                     )
 
+                extra.image_mask = image_mask
+
             if self.write_images:
                 writer.write(
                     table_name=f"dl1/event/telescope/images/{tel_type}",
-                    containers=[tel_index, data],
+                    containers=[tel_index, data, extra],
                 )
 
     def _generate_table_indices(self, h5file, start_node):
@@ -828,13 +924,13 @@ class Stage1Process(Tool):
                     node.cols.obs_id.create_index(kind="ultralight")
             else:
                 # recurse
-                self._generate_table_indices(writer, node)
+                self._generate_table_indices(h5file, node)
 
     def _generate_indices(self,):
-        h5file = tables.open_file(self.output_filename, mode="a")
-        self._generate_table_indices(h5file, "/dl1/event/telescope/images")
-        # self._generate_table_indices(writer, "/dl1/event/subarray")
-        h5file.close()
+        with tables.open_file(self.output_filename, mode="a") as h5file:
+            if self.write_images:
+                self._generate_table_indices(h5file, "/dl1/event/telescope/images")
+            self._generate_table_indices(writer, "/dl1/event/subarray")
 
     def start(self):
 
@@ -844,8 +940,16 @@ class Stage1Process(Tool):
 
             self._process_events(writer)
             self._write_simulation_histograms(writer)
+            self._write_processing_statistics()
 
-        self._generate_indices()
+        if self.write_index_tables:
+            self._generate_indices()
+
+        write_core_provenance(
+            output_filename=self.output_filename,
+            subarray=self.subarray,
+            obs_id=self._cur_obs_id,
+        )
 
     def finish(self):
         pass
